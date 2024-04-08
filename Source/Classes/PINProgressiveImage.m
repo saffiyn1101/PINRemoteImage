@@ -335,26 +335,35 @@
         return inputImage;
     }
     
-    CGContextRef ctx;
 #if PIN_TARGET_IOS
-    UIGraphicsBeginImageContextWithOptions(inputSize, YES, imageScale);
-    ctx = UIGraphicsGetCurrentContext();
+    outputImage = [self iOSImageProcess: imageScale inputSize: inputSize inputImage: inputImage radius: radius];
 #elif PIN_TARGET_MAC
-    ctx = CGBitmapContextCreate(0, inputSize.width, inputSize.height, 8, 0, [NSColorSpace genericRGBColorSpace].CGColorSpace, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+    outputImage = [self macImageProcess: inputSize inputImage: inputImage radius: radius];
 #endif
+
+    CGImageRelease(inputImageRef);
     
-    if (ctx) {
-#if PIN_TARGET_IOS
+    return outputImage;
+}
+
+- (PINImage *) iOSImageProcess: (CGFloat)imageScale inputSize: (CGSize)inputSize inputImage: (PINImage *)inputImage radius: (CGFloat)radius {
+    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
+    format.opaque = YES;
+    format.scale = imageScale;
+
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize: inputSize format: format];
+    return [renderer imageWithActions: ^(UIGraphicsImageRendererContext * _Nonnull rendererContext) {
+        CGContextRef ctx = rendererContext.CGContext;
+
         CGContextScaleCTM(ctx, 1.0, -1.0);
         CGContextTranslateCTM(ctx, 0, -inputSize.height);
-#endif
-        
+
         vImage_Buffer effectInBuffer;
         vImage_Buffer scratchBuffer;
-        
+
         vImage_Buffer *inputBuffer;
         vImage_Buffer *outputBuffer;
-        
+
         vImage_CGImageFormat format = {
             .bitsPerComponent = 8,
             .bitsPerPixel = 32,
@@ -366,7 +375,7 @@
             .decode = NULL,
             .renderingIntent = kCGRenderingIntentDefault
         };
-        
+
         vImage_Error e = vImageBuffer_InitWithCGImage(&effectInBuffer, &format, NULL, inputImage.CGImage, kvImagePrintDiagnosticsToConsole);
         if (e == kvImageNoError)
         {
@@ -374,7 +383,7 @@
             if (e == kvImageNoError) {
                 inputBuffer = &effectInBuffer;
                 outputBuffer = &scratchBuffer;
-                
+
                 // A description of how to compute the box kernel width from the Gaussian
                 // radius (aka standard deviation) appears in the SVG spec:
                 // http://www.w3.org/TR/SVG/filters.html#feGaussianBlurElement
@@ -387,29 +396,130 @@
                 //
                 // ... if d is odd, use three box-blurs of size 'd', centered on the output pixel.
                 //
+
+                CGFloat newRadius = 0.0;
                 if (radius - 2. < __FLT_EPSILON__)
-                    radius = 2.;
-                uint32_t wholeRadius = floor((radius * 3. * sqrt(2 * M_PI) / 4 + 0.5) / 2);
-                
+                    newRadius = 2.;
+                uint32_t wholeRadius = floor((newRadius * 3. * sqrt(2 * M_PI) / 4 + 0.5) / 2);
+
                 wholeRadius |= 1; // force wholeRadius to be odd so that the three box-blur methodology works.
-                
+
                 //calculate the size necessary for vImageBoxConvolve_ARGB8888, this does not actually do any operations.
                 NSInteger tempBufferSize = vImageBoxConvolve_ARGB8888(inputBuffer, outputBuffer, NULL, 0, 0, wholeRadius, wholeRadius, NULL, kvImageGetTempBufferSize | kvImageEdgeExtend);
                 void *tempBuffer = malloc(tempBufferSize);
-                
+
                 if (tempBuffer) {
                     //errors can be ignored because we've passed in allocated memory
                     vImageBoxConvolve_ARGB8888(inputBuffer, outputBuffer, tempBuffer, 0, 0, wholeRadius, wholeRadius, NULL, kvImageEdgeExtend);
                     vImageBoxConvolve_ARGB8888(outputBuffer, inputBuffer, tempBuffer, 0, 0, wholeRadius, wholeRadius, NULL, kvImageEdgeExtend);
                     vImageBoxConvolve_ARGB8888(inputBuffer, outputBuffer, tempBuffer, 0, 0, wholeRadius, wholeRadius, NULL, kvImageEdgeExtend);
-                    
+
                     free(tempBuffer);
-                    
+
                     //switch input and output
                     vImage_Buffer *temp = inputBuffer;
                     inputBuffer = outputBuffer;
                     outputBuffer = temp;
-                    
+
+                    CGImageRef effectCGImage = vImageCreateCGImageFromBuffer(inputBuffer, &format, &cleanupBuffer, NULL, kvImageNoAllocate, NULL);
+                    if (effectCGImage == NULL) {
+                        //if creating the cgimage failed, the cleanup buffer on input buffer will not be called, we must dealloc ourselves
+                        free(inputBuffer->data);
+                    } else {
+                        // draw effect image
+                        CGContextDrawImage(ctx, CGRectMake(0, 0, inputSize.width, inputSize.height), effectCGImage);
+                        CGImageRelease(effectCGImage);
+                    }
+
+                    // Cleanup
+                    free(outputBuffer->data);
+                }
+            } else {
+                if (scratchBuffer.data) {
+                    free(scratchBuffer.data);
+                }
+                free(effectInBuffer.data);
+            }
+        } else {
+            if (effectInBuffer.data) {
+                free(effectInBuffer.data);
+            }
+        }
+    }];
+}
+
+- (PINImage *) macImageProcess: (CGSize)inputSize inputImage: (PINImage *)inputImage radius: (CGFloat)radius {
+    PINImage *outputImage = nil;
+
+    CGContextRef ctx;
+#if PIN_TARGET_MAC
+    ctx = CGBitmapContextCreate(0, inputSize.width, inputSize.height, 8, 0, [NSColorSpace genericRGBColorSpace].CGColorSpace, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+#endif
+
+    if (ctx) {
+        vImage_Buffer effectInBuffer;
+        vImage_Buffer scratchBuffer;
+
+        vImage_Buffer *inputBuffer;
+        vImage_Buffer *outputBuffer;
+
+        vImage_CGImageFormat format = {
+            .bitsPerComponent = 8,
+            .bitsPerPixel = 32,
+            .colorSpace = NULL,
+            // (kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little)
+            // requests a BGRA buffer.
+            .bitmapInfo = kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little,
+            .version = 0,
+            .decode = NULL,
+            .renderingIntent = kCGRenderingIntentDefault
+        };
+
+        vImage_Error e = vImageBuffer_InitWithCGImage(&effectInBuffer, &format, NULL, inputImage.CGImage, kvImagePrintDiagnosticsToConsole);
+        if (e == kvImageNoError)
+        {
+            e = vImageBuffer_Init(&scratchBuffer, effectInBuffer.height, effectInBuffer.width, format.bitsPerPixel, kvImageNoFlags);
+            if (e == kvImageNoError) {
+                inputBuffer = &effectInBuffer;
+                outputBuffer = &scratchBuffer;
+
+                // A description of how to compute the box kernel width from the Gaussian
+                // radius (aka standard deviation) appears in the SVG spec:
+                // http://www.w3.org/TR/SVG/filters.html#feGaussianBlurElement
+                //
+                // For larger values of 's' (s >= 2.0), an approximation can be used: Three
+                // successive box-blurs build a piece-wise quadratic convolution kernel, which
+                // approximates the Gaussian kernel to within roughly 3%.
+                //
+                // let d = floor(s * 3*sqrt(2*pi)/4 + 0.5)
+                //
+                // ... if d is odd, use three box-blurs of size 'd', centered on the output pixel.
+                //
+
+                CGFloat newRadius = 0.0;
+                if (radius - 2. < __FLT_EPSILON__)
+                    newRadius = 2.;
+                uint32_t wholeRadius = floor((newRadius * 3. * sqrt(2 * M_PI) / 4 + 0.5) / 2);
+
+                wholeRadius |= 1; // force wholeRadius to be odd so that the three box-blur methodology works.
+
+                //calculate the size necessary for vImageBoxConvolve_ARGB8888, this does not actually do any operations.
+                NSInteger tempBufferSize = vImageBoxConvolve_ARGB8888(inputBuffer, outputBuffer, NULL, 0, 0, wholeRadius, wholeRadius, NULL, kvImageGetTempBufferSize | kvImageEdgeExtend);
+                void *tempBuffer = malloc(tempBufferSize);
+
+                if (tempBuffer) {
+                    //errors can be ignored because we've passed in allocated memory
+                    vImageBoxConvolve_ARGB8888(inputBuffer, outputBuffer, tempBuffer, 0, 0, wholeRadius, wholeRadius, NULL, kvImageEdgeExtend);
+                    vImageBoxConvolve_ARGB8888(outputBuffer, inputBuffer, tempBuffer, 0, 0, wholeRadius, wholeRadius, NULL, kvImageEdgeExtend);
+                    vImageBoxConvolve_ARGB8888(inputBuffer, outputBuffer, tempBuffer, 0, 0, wholeRadius, wholeRadius, NULL, kvImageEdgeExtend);
+
+                    free(tempBuffer);
+
+                    //switch input and output
+                    vImage_Buffer *temp = inputBuffer;
+                    inputBuffer = outputBuffer;
+                    outputBuffer = temp;
+
                     CGImageRef effectCGImage = vImageCreateCGImageFromBuffer(inputBuffer, &format, &cleanupBuffer, NULL, kvImageNoAllocate, NULL);
                     if (effectCGImage == NULL) {
                         //if creating the cgimage failed, the cleanup buffer on input buffer will not be called, we must dealloc ourselves
@@ -421,17 +531,14 @@
                         CGContextRestoreGState(ctx);
                         CGImageRelease(effectCGImage);
                     }
-                    
+
                     // Cleanup
                     free(outputBuffer->data);
-#if PIN_TARGET_IOS
-                    outputImage = UIGraphicsGetImageFromCurrentImageContext();
-#elif PIN_TARGET_MAC
+#if PIN_TARGET_MAC
                     CGImageRef outputImageRef = CGBitmapContextCreateImage(ctx);
                     outputImage = [[NSImage alloc] initWithCGImage:outputImageRef size:inputSize];
                     CFRelease(outputImageRef);
 #endif
-                    
                 }
             } else {
                 if (scratchBuffer.data) {
@@ -445,13 +552,7 @@
             }
         }
     }
-    
-#if PIN_TARGET_IOS
-    UIGraphicsEndImageContext();
-#endif
 
-    CGImageRelease(inputImageRef);
-    
     return outputImage;
 }
 
